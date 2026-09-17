@@ -15,315 +15,644 @@ As a member of the Nautilus DevOps Team, your task is to perform the following:
 
 The commands below use the AWS CLI and assume that the EC2 instance is running a web server on port `80` and that its security group allows HTTP traffic.
 
+## Prerequisites & Architecture Overview
+
+- ALB Name: `datacenter-alb`
+- Target Group Name: `datacenter-tg` (Port `80`)
+- ALB Security Group: `datacenter-sg` (Inbound Port `80` from `0.0.0.0/0`)
+- EC2 Instance: `datacenter-ec2` (Traffic forwarded to Port `80`)
+- EC2 Security Group: Must allow inbound traffic on Port `80` from `datacenter-sg`
+
+In this architecture, the Application Load Balancer receives internet traffic on port `80`, forwards the request to the target group, and the target group sends it to the EC2 instance running the web application. The EC2 instance must allow traffic from the ALB security group so the request path is complete.
+
 ## Solution
 
-### 1. Set and Verify the AWS Region
+### Method 1: AWS Management Console
 
-Use the configured AWS region for the remaining AWS CLI commands.
+#### Step 1: Create Security Group for ALB (`datacenter-sg`)
+
+Go to the EC2 Console → Security Groups (under Network & Security).
+
+Click Create security group.
+
+Set:
+
+- Security group name: `datacenter-sg`
+- Description: `Security group for datacenter ALB`
+- VPC: Select the same VPC where `datacenter-ec2` is deployed.
+
+Under Inbound rules, click Add rule:
+
+- Type: `HTTP`
+- Port range: `80`
+- Source: `Anywhere-IPv4 (0.0.0.0/0)`
+
+Leave Outbound rules to default (All traffic).
+
+Click Create security group.
+
+#### Step 2: Update the EC2 Instance Security Group
+
+To ensure the ALB can send traffic to Nginx on `datacenter-ec2`:
+
+1. In the EC2 Console, go to Instances and select `datacenter-ec2`.
+2. Under the Security tab, click the attached security group.
+3. Click Actions → Edit inbound rules.
+4. Click Add rule.
+5. Set:
+   - Type: `HTTP`
+   - Port range: `80`
+   - Source: Select Custom and search/select `datacenter-sg`
+6. Click Save rules.
+
+#### Step 3: Create Target Group (`datacenter-tg`)
+
+Go to Target Groups (under Load Balancing).
+
+Click Create target group.
+
+Configure target group settings:
+
+- Target type: `Instances`
+- Target group name: `datacenter-tg`
+- Protocol: `HTTP`
+- Port: `80`
+- IP address type: `IPv4`
+- VPC: Select the VPC of `datacenter-ec2`
+- Health checks: Protocol `HTTP`, Path `/`
+
+Click Next.
+
+Under Register targets:
+
+- Find and select `datacenter-ec2`.
+- Ensure port is `80`.
+- Click Include as pending below.
+- Click Create target group.
+
+#### Step 4: Create Application Load Balancer (`datacenter-alb`)
+
+Go to Load Balancers (under Load Balancing).
+
+Click Create load balancer, then under Application Load Balancer, click Create.
+
+Basic configuration:
+
+- Load balancer name: `datacenter-alb`
+- Scheme: `Internet-facing`
+- IP address type: `IPv4`
+
+Network mapping:
+
+- VPC: Select the VPC where your instance is running.
+- Mappings: Select at least two Availability Zones and their corresponding public subnets.
+
+Security groups:
+
+- Remove any default security group.
+- Select `datacenter-sg`.
+
+Listeners and routing:
+
+- Protocol: `HTTP`
+- Port: `80`
+- Default action: Select Forward to → `datacenter-tg`
+
+Review the configuration and click Create load balancer.
+
+#### Step 5: Verification
+
+Wait 2–3 minutes for the ALB state to change from Provisioning to Active.
+
+Then:
+
+1. Go to Target Groups → select `datacenter-tg` → click the Targets tab.
+2. Confirm the health status of `datacenter-ec2` is Healthy.
+3. Go to Load Balancers → copy the DNS name of `datacenter-alb`.
+
+Run in your terminal or browser:
 
 ```bash
-REGION=$(aws configure get region)
-echo "REGION=$REGION"
+curl http://<ALB-DNS-Name>
 ```
 
-Example output:
+You should see the sample Nginx welcome page.
 
-```text
-REGION=us-east-1
-```
+### Method 2: AWS CLI
 
-The `REGION` variable is required because AWS resources are regional. The load balancer, target group, and EC2 instance must be managed in the same region.
-
-### 2. Define the Load Balancer Settings
-
-Define the names and ports that will be used by the load balancer.
+#### 1. Identify the VPC ID and Instance ID
 
 ```bash
-ALB_NAME=datacenter-alb
-TARGET_GROUP_NAME=datacenter-targets
-LISTENER_PORT=80
-TARGET_PORT=80
-
-echo "ALB_NAME=$ALB_NAME"
-echo "TARGET_GROUP_NAME=$TARGET_GROUP_NAME"
-echo "LISTENER_PORT=$LISTENER_PORT"
-echo "TARGET_PORT=$TARGET_PORT"
-```
-
-The variables are required for the following reasons:
-
-- `ALB_NAME` identifies the load balancer and must be unique in the region.
-- `TARGET_GROUP_NAME` identifies the group of backend targets that receive traffic.
-- `LISTENER_PORT` is the port on which the load balancer accepts client requests.
-- `TARGET_PORT` is the port on which the EC2 application receives forwarded requests.
-
-Keeping these values in variables prevents the commands from using inconsistent names or ports.
-
-### 3. Find the EC2 Instance and VPC
-
-Find the instance created in the previous EC2 task and save its identifiers.
-
-```bash
+VPC_ID=$(aws ec2 describe-vpcs --query "Vpcs[0].VpcId" --output text)
 INSTANCE_ID=$(aws ec2 describe-instances \
-	--region "$REGION" \
-	--filters "Name=tag:Name,Values=datacenter-ec2" "Name=instance-state-name,Values=running" \
-	--query 'Reservations[0].Instances[0].InstanceId' \
-	--output text)
-
-VPC_ID=$(aws ec2 describe-instances \
-	--region "$REGION" \
-	--instance-ids "$INSTANCE_ID" \
-	--query 'Reservations[0].Instances[0].VpcId' \
-	--output text)
-
-SECURITY_GROUP_ID=$(aws ec2 describe-instances \
-	--region "$REGION" \
-	--instance-ids "$INSTANCE_ID" \
-	--query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' \
-	--output text)
-
-echo "INSTANCE_ID=$INSTANCE_ID"
-echo "VPC_ID=$VPC_ID"
-echo "SECURITY_GROUP_ID=$SECURITY_GROUP_ID"
+  --filters "Name=tag:Name,Values=datacenter-ec2" "Name=instance-state-name,Values=running" \
+  --query "Reservations[].Instances[].InstanceId" --output text)
 ```
 
-Example output:
-
-```text
-INSTANCE_ID=i-xxxxxxxxxxxxxxxxx
-VPC_ID=vpc-xxxxxxxxxxxxxxxxx
-SECURITY_GROUP_ID=sg-xxxxxxxxxxxxxxxxx
-```
-
-The variables are required for the following reasons:
-
-- `INSTANCE_ID` identifies the EC2 instance that will receive traffic.
-- `VPC_ID` identifies the virtual network where the target group belongs.
-- `SECURITY_GROUP_ID` controls network traffic to the load balancer. The selected security group must allow inbound HTTP traffic on port `80`.
-
-The `describe-instances` commands query AWS instead of requiring these IDs to be copied manually. If `INSTANCE_ID` is `None`, confirm that the instance exists, is running, and has the `datacenter-ec2` name tag.
-
-### 4. Select Two Subnets in Different Availability Zones
-
-An Application Load Balancer requires subnets in at least two Availability Zones. Select two available subnets from the instance's VPC.
+#### 2. Create a Security Group for the ALB
 
 ```bash
-SUBNET_ID_1=$(aws ec2 describe-subnets \
-	--region "$REGION" \
-	--filters "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available" \
-	--query 'Subnets | sort_by(@, &AvailabilityZone)[0].SubnetId' \
-	--output text)
-
-SUBNET_ID_2=$(aws ec2 describe-subnets \
-	--region "$REGION" \
-	--filters "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available" \
-	--query 'Subnets | sort_by(@, &AvailabilityZone)[1].SubnetId' \
-	--output text)
-
-AVAILABILITY_ZONE_1=$(aws ec2 describe-subnets \
-	--region "$REGION" \
-	--subnet-ids "$SUBNET_ID_1" \
-	--query 'Subnets[0].AvailabilityZone' \
-	--output text)
-
-AVAILABILITY_ZONE_2=$(aws ec2 describe-subnets \
-	--region "$REGION" \
-	--subnet-ids "$SUBNET_ID_2" \
-	--query 'Subnets[0].AvailabilityZone' \
-	--output text)
-
-echo "SUBNET_ID_1=$SUBNET_ID_1"
-echo "SUBNET_ID_2=$SUBNET_ID_2"
-echo "AVAILABILITY_ZONE_1=$AVAILABILITY_ZONE_1"
-echo "AVAILABILITY_ZONE_2=$AVAILABILITY_ZONE_2"
+ALB_SG_ID=$(aws ec2 create-security-group \
+  --group-name datacenter-sg \
+  --description "Security group for datacenter-alb" \
+  --vpc-id $VPC_ID \
+  --query "GroupId" --output text)
 ```
 
-The variables are required for the following reasons:
-
-- `SUBNET_ID_1` and `SUBNET_ID_2` place the load balancer across two subnets for availability and AWS ALB requirements.
-- `AVAILABILITY_ZONE_1` and `AVAILABILITY_ZONE_2` verify that the selected subnets are in different Availability Zones.
-
-The two Availability Zone values must be different. If they match, choose another subnet for `SUBNET_ID_2`; otherwise, ALB creation will fail.
-
-### 5. Allow HTTP Traffic to the EC2 Instance
-
-The target must accept the same HTTP traffic that the load balancer forwards. Add an inbound rule for port `80` when it is not already present.
+Allow port `80` from the public internet:
 
 ```bash
 aws ec2 authorize-security-group-ingress \
-	--region "$REGION" \
-	--group-id "$SECURITY_GROUP_ID" \
-	--protocol tcp \
-	--port "$TARGET_PORT" \
-	--cidr 0.0.0.0/0 2>/dev/null || echo "HTTP ingress may already exist"
+  --group-id $ALB_SG_ID \
+  --protocol tcp \
+  --port 80 \
+  --cidr 0.0.0.0/0
 ```
 
-The `authorize-security-group-ingress` command adds an inbound security group rule. The `--protocol`, `--port`, and `--cidr` options define TCP HTTP traffic from any IPv4 client. The fallback message prevents an already-existing rule from stopping the rest of the procedure.
-
-For production workloads, restrict the rule to the load balancer security group instead of `0.0.0.0/0` and use HTTPS where appropriate.
-
-### 6. Create the Target Group
-
-Create a target group for the EC2 instance and configure an HTTP health check.
+#### 3. Allow Traffic from the ALB Security Group to the EC2 Instance
 
 ```bash
-TARGET_GROUP_ARN=$(aws elbv2 create-target-group \
-	--region "$REGION" \
-	--name "$TARGET_GROUP_NAME" \
-	--protocol HTTP \
-	--port "$TARGET_PORT" \
-	--vpc-id "$VPC_ID" \
-	--health-check-protocol HTTP \
-	--health-check-port traffic-port \
-	--health-check-path / \
-	--query 'TargetGroups[0].TargetGroupArn' \
-	--output text)
+INSTANCE_SG_ID=$(aws ec2 describe-instances \
+  --instance-ids $INSTANCE_ID \
+  --query "Reservations[0].Instances[0].SecurityGroups[0].GroupId" --output text)
 
-echo "TARGET_GROUP_ARN=$TARGET_GROUP_ARN"
+aws ec2 authorize-security-group-ingress \
+  --group-id $INSTANCE_SG_ID \
+  --protocol tcp \
+  --port 80 \
+  --source-group $ALB_SG_ID
 ```
 
-The `TARGET_GROUP_ARN` variable is required because later commands use the target group's full Amazon Resource Name to register the instance and configure the listener.
+#### 4. Create the Target Group
 
-The `create-target-group` command creates the backend pool. The health check requests `/` over HTTP. A target is considered healthy only when it responds successfully according to the target group's health-check settings.
+```bash
+TG_ARN=$(aws elbv2 create-target-group \
+  --name datacenter-tg \
+  --protocol HTTP \
+  --port 80 \
+  --vpc-id $VPC_ID \
+  --target-type instance \
+  --query "TargetGroups[0].TargetGroupArn" --output text)
+```
 
-### 7. Register the EC2 Instance
-
-Add the running instance to the target group.
+Register the EC2 instance:
 
 ```bash
 aws elbv2 register-targets \
-	--region "$REGION" \
-	--target-group-arn "$TARGET_GROUP_ARN" \
-	--targets Id="$INSTANCE_ID",Port="$TARGET_PORT"
+  --target-group-arn $TG_ARN \
+  --targets Id=$INSTANCE_ID,Port=80
 ```
 
-The `register-targets` command connects the EC2 instance to the target group. The `Id` value identifies the instance, while `Port` tells the load balancer where the application is listening.
-
-### 8. Create the Application Load Balancer
-
-Create an internet-facing load balancer in the two selected subnets.
+#### 5. Fetch Two Public Subnets for the ALB
 
 ```bash
-LOAD_BALANCER_ARN=$(aws elbv2 create-load-balancer \
-	--region "$REGION" \
-	--name "$ALB_NAME" \
-	--scheme internet-facing \
-	--type application \
-	--security-groups "$SECURITY_GROUP_ID" \
-	--subnets "$SUBNET_ID_1" "$SUBNET_ID_2" \
-	--query 'LoadBalancers[0].LoadBalancerArn' \
-	--output text)
-
-LOAD_BALANCER_DNS_NAME=$(aws elbv2 describe-load-balancers \
-	--region "$REGION" \
-	--load-balancer-arns "$LOAD_BALANCER_ARN" \
-	--query 'LoadBalancers[0].DNSName' \
-	--output text)
-
-echo "LOAD_BALANCER_ARN=$LOAD_BALANCER_ARN"
-echo "LOAD_BALANCER_DNS_NAME=$LOAD_BALANCER_DNS_NAME"
+SUBNET_IDS=$(aws ec2 describe-subnets \
+  --filters "Name=vpc-id,Values=$VPC_ID" \
+  --query "Subnets[0:2].SubnetId" --output text)
 ```
 
-The variables are required for the following reasons:
-
-- `LOAD_BALANCER_ARN` identifies the new ALB for listener and verification commands.
-- `LOAD_BALANCER_DNS_NAME` is the client-facing hostname used to test the application.
-
-The `create-load-balancer` command creates an Application Load Balancer that can receive traffic from the internet. The ALB is placed in both subnets and uses the selected security group.
-
-### 9. Create an HTTP Listener
-
-Create a listener that accepts HTTP requests and forwards them to the target group.
+#### 6. Create the Application Load Balancer
 
 ```bash
-LISTENER_ARN=$(aws elbv2 create-listener \
-	--region "$REGION" \
-	--load-balancer-arn "$LOAD_BALANCER_ARN" \
-	--protocol HTTP \
-	--port "$LISTENER_PORT" \
-	--default-actions Type=forward,TargetGroupArn="$TARGET_GROUP_ARN" \
-	--query 'Listeners[0].ListenerArn' \
-	--output text)
-
-echo "LISTENER_ARN=$LISTENER_ARN"
+ALB_ARN=$(aws elbv2 create-load-balancer \
+  --name datacenter-alb \
+  --subnets $SUBNET_IDS \
+  --security-groups $ALB_SG_ID \
+  --scheme internet-facing \
+  --type application \
+  --query "LoadBalancers[0].LoadBalancerArn" --output text)
 ```
 
-The `LISTENER_ARN` variable identifies the listener and is useful for later inspection or modification. The `create-listener` command defines the protocol and port used by clients and sets the default action to forward requests to the target group.
-
-### 10. Verify the Load Balancer and Target Health
-
-Check that the listener exists and that the EC2 target is healthy.
+#### 7. Create the HTTP Listener
 
 ```bash
-aws elbv2 describe-listeners \
-	--region "$REGION" \
-	--load-balancer-arn "$LOAD_BALANCER_ARN" \
-	--query 'Listeners[].[ListenerArn,Protocol,Port,DefaultActions[0].TargetGroupArn]' \
-	--output table
-
-aws elbv2 describe-target-health \
-	--region "$REGION" \
-	--target-group-arn "$TARGET_GROUP_ARN" \
-	--query 'TargetHealthDescriptions[].[Target.Id,Target.Port,TargetHealth.State,TargetHealth.Reason]' \
-	--output table
+aws elbv2 create-listener \
+  --load-balancer-arn $ALB_ARN \
+  --protocol HTTP \
+  --port 80 \
+  --default-actions Type=forward,TargetGroupArn=$TG_ARN
 ```
 
-The listener output confirms that the ALB accepts HTTP traffic and forwards it to the intended target group. The target health output should show the instance with a state of `healthy`.
-
-The target can initially show `initial` while AWS performs its first health check. A state of `unhealthy` usually means that the web server is not running, the health-check path is incorrect, the instance is not listening on port `80`, or the security group blocks the traffic.
-
-Test the endpoint after the target becomes healthy:
+#### 8. Verify the Target Health and Retrieve the ALB DNS Name
 
 ```bash
-curl "http://$LOAD_BALANCER_DNS_NAME"
+aws elbv2 describe-target-health --target-group-arn $TG_ARN
 ```
 
-The `curl` command sends an HTTP request to the ALB DNS name. A response from the EC2 web server confirms that the complete path from the client through the listener and target group is working.
+```bash
+aws elbv2 describe-load-balancers \
+  --names datacenter-alb \
+  --query "LoadBalancers[0].DNSName" \
+  --output text
+```
+
+Test the endpoint:
+
+```bash
+curl http://$(aws elbv2 describe-load-balancers \
+  --names datacenter-alb \
+  --query "LoadBalancers[0].DNSName" \
+  --output text)
+```
+
+You should see the sample Nginx welcome page.
+
+## Command Explanations
+
+### `aws ec2 describe-vpcs`
+
+This command retrieves the VPC details for the instance environment.
+
+- `aws`: starts the AWS CLI.
+- `ec2`: indicates EC2 commands.
+- `describe-vpcs`: lists the VPCs in the region.
+- `--query "Vpcs[0].VpcId"`: fetches the first VPC ID from the list.
+- `--output text`: prints the value in a simple text format.
+
+This helps identify the correct VPC where the EC2 instance and ALB should be created.
+
+### `aws ec2 describe-instances`
+
+This command retrieves details about EC2 instances in your AWS account.
+
+- `describe-instances`: fetches instance metadata such as instance IDs, VPC IDs, security groups, and state.
+- `--filters`: narrows the search to the instance named `datacenter-ec2` and only includes the running instance.
+- `--query`: extracts just the instance ID from the response.
+- `--output text`: provides the output in a clean text format for scripts.
+
+This step is critical because the load balancer must know which EC2 instance to target.
+
+### `aws ec2 create-security-group`
+
+This command creates a security group for the load balancer.
+
+- `create-security-group`: creates a new security group in the selected VPC.
+- `--group-name datacenter-sg`: sets the security group name.
+- `--description`: adds a description of the purpose.
+- `--vpc-id $VPC_ID`: associates the SG with the same VPC as the EC2 instance.
+- `--query "GroupId" --output text`: returns only the group ID.
+
+This security group allows the ALB to accept public HTTP traffic.
+
+### `aws ec2 authorize-security-group-ingress`
+
+This command adds inbound rules to a security group.
+
+- `authorize-security-group-ingress`: opens a port on the selected security group.
+- `--group-id`: identifies which security group to update.
+- `--protocol tcp`: uses the TCP protocol.
+- `--port 80`: allows HTTP traffic.
+- `--cidr 0.0.0.0/0`: allows access from all IPv4 addresses.
+- `--source-group $ALB_SG_ID`: allows the ALB security group to reach the EC2 instance.
+
+This step ensures both the public ALB and the private instance can communicate over port `80`.
+
+### `aws elbv2 create-target-group`
+
+This command creates the target group used by the ALB.
+
+- `elbv2`: indicates Elastic Load Balancing v2 commands.
+- `create-target-group`: creates a new target group.
+- `--name datacenter-tg`: sets the target group name.
+- `--protocol HTTP`: uses HTTP for health checks and traffic forwarding.
+- `--port 80`: specifies the backend port.
+- `--vpc-id $VPC_ID`: sets the target group in the same VPC.
+- `--target-type instance`: registers EC2 instances as targets.
+
+This target group is the destination where the ALB sends requests.
+
+### `aws elbv2 register-targets`
+
+This command registers the EC2 instance with the target group.
+
+- `register-targets`: adds a target to the group.
+- `--target-group-arn $TG_ARN`: selects the target group.
+- `--targets Id=$INSTANCE_ID,Port=80`: registers the instance and the port it listens on.
+
+Without this step, the load balancer has no EC2 instance to forward traffic to.
+
+### `aws elbv2 create-load-balancer`
+
+This command creates the Application Load Balancer.
+
+- `create-load-balancer`: creates the actual ALB.
+- `--name datacenter-alb`: sets the ALB name.
+- `--subnets $SUBNET_IDS`: deploys it in public subnets.
+- `--security-groups $ALB_SG_ID`: attaches the ALB security group.
+- `--scheme internet-facing`: makes the ALB publicly reachable.
+- `--type application`: creates an ALB.
+
+This is the main AWS resource that receives client requests.
+
+### `aws elbv2 create-listener`
+
+This command creates the listener for HTTP traffic.
+
+- `create-listener`: defines how incoming requests are handled.
+- `--load-balancer-arn $ALB_ARN`: identifies the ALB.
+- `--protocol HTTP`: enables HTTP traffic.
+- `--port 80`: listens on port `80`.
+- `--default-actions Type=forward,TargetGroupArn=$TG_ARN`: forwards requests to the target group.
+
+This completes the routing flow from the public ALB to the EC2 instance.
+
+### `aws elbv2 describe-target-health`
+
+This command checks whether the EC2 instance is healthy.
+
+- `describe-target-health`: shows the status of each target in the group.
+- `--target-group-arn $TG_ARN`: selects the target group to inspect.
+
+The target should eventually report Healthy before the ALB is considered ready.
+
+### `curl`
+
+This command is used to test the final endpoint.
+
+```bash
+curl http://$(aws elbv2 describe-load-balancers \
+  --names datacenter-alb \
+  --query "LoadBalancers[0].DNSName" \
+  --output text)
+```
+
+- `curl`: sends an HTTP request.
+- `http://...`: connects to the ALB DNS name.
+- `$(...)`: resolves the DNS name dynamically from AWS.
+
+If configured correctly, the command returns the Nginx default page from the EC2 instance.
+
+## Final Note
+
+The workflow follows a secure and reliable pattern:
+
+1. Create a dedicated ALB security group.
+2. Allow public HTTP access to the ALB.
+3. Permit inbound traffic from the ALB security group on the EC2 instance.
+4. Create a target group and register the instance.
+5. Create the ALB and attach an HTTP listener.
+6. Verify the target health and test the endpoint with the ALB DNS name.
+
+This ensures the EC2 instance is reachable through the ALB while preserving proper security and health checks.
+```bash
+VPC_ID=$(aws ec2 describe-vpcs --query "Vpcs[0].VpcId" --output text)
+INSTANCE_ID=$(aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=datacenter-ec2" "Name=instance-state-name,Values=running" \
+  --query "Reservations[].Instances[].InstanceId" --output text)
+```
+
+If you want to confirm which subnets are available in the same VPC, you can also run:
+
+```bash
+SUBNET_IDS=$(aws ec2 describe-subnets \
+  --filters "Name=vpc-id,Values=$VPC_ID" \
+  --query "Subnets[0:2].SubnetId" --output text)
+```
+
+This gives you the network context needed to create the load balancer in the correct VPC and subnets.
+
+### 2. Create a Security Group for the ALB
+
+Create a security group that allows inbound HTTP traffic from the internet.
+
+```bash
+ALB_SG_ID=$(aws ec2 create-security-group \
+  --group-name datacenter-sg \
+  --description "Security group for datacenter-alb" \
+  --vpc-id $VPC_ID \
+  --query "GroupId" --output text)
+```
+
+Allow port `80` from anywhere so the ALB can be reachable publicly:
+
+```bash
+aws ec2 authorize-security-group-ingress \
+  --group-id $ALB_SG_ID \
+  --protocol tcp \
+  --port 80 \
+  --cidr 0.0.0.0/0
+```
+
+### 3. Allow Traffic from the ALB to the EC2 Instance
+
+The EC2 instance must accept HTTP traffic coming from the ALB security group.
+
+```bash
+INSTANCE_SG_ID=$(aws ec2 describe-instances \
+  --instance-ids $INSTANCE_ID \
+  --query "Reservations[0].Instances[0].SecurityGroups[0].GroupId" --output text)
+
+aws ec2 authorize-security-group-ingress \
+  --group-id $INSTANCE_SG_ID \
+  --protocol tcp \
+  --port 80 \
+  --source-group $ALB_SG_ID
+```
+
+This allows the ALB to route requests to the backend EC2 instance on port `80` without exposing the instance to the public directly.
+
+### 4. Create the Target Group
+
+Create a target group named `datacenter-targets` in the same VPC and register the EC2 instance as a target.
+
+```bash
+TG_ARN=$(aws elbv2 create-target-group \
+  --name datacenter-targets \
+  --protocol HTTP \
+  --port 80 \
+  --vpc-id $VPC_ID \
+  --target-type instance \
+  --query "TargetGroups[0].TargetGroupArn" --output text)
+```
+
+```bash
+aws elbv2 register-targets \
+  --target-group-arn $TG_ARN \
+  --targets Id=$INSTANCE_ID,Port=80
+```
+
+The target group tells AWS where to send incoming traffic and performs health checks on the registered instance.
+
+### 5. Create the Application Load Balancer
+
+Create the internet-facing ALB and attach it to the selected public subnets.
+
+```bash
+ALB_ARN=$(aws elbv2 create-load-balancer \
+  --name datacenter-alb \
+  --subnets $SUBNET_IDS \
+  --security-groups $ALB_SG_ID \
+  --scheme internet-facing \
+  --type application \
+  --query "LoadBalancers[0].LoadBalancerArn" --output text)
+```
+
+This creates the load balancer in the VPC and makes it available to the public through its DNS name.
+
+### 6. Create the HTTP Listener
+
+Create a listener that listens on port `80` and forwards traffic to the target group.
+
+```bash
+aws elbv2 create-listener \
+  --load-balancer-arn $ALB_ARN \
+  --protocol HTTP \
+  --port 80 \
+  --default-actions Type=forward,TargetGroupArn=$TG_ARN
+```
+
+### 7. Verify the Health of the Target and Retrieve the ALB DNS Name
+
+Check if the target is healthy before testing the application.
+
+```bash
+aws elbv2 describe-target-health --target-group-arn $TG_ARN
+```
+
+Get the ALB DNS name:
+
+```bash
+aws elbv2 describe-load-balancers \
+  --names datacenter-alb \
+  --query "LoadBalancers[0].DNSName" \
+  --output text
+```
+
+Now test the service from a browser or terminal:
+
+```bash
+curl http://$(aws elbv2 describe-load-balancers \
+  --names datacenter-alb \
+  --query "LoadBalancers[0].DNSName" \
+  --output text)
+```
+
+If the web server is running correctly, the load balancer should return the default page from the EC2 instance.
 
 ## Command Explanations
 
 ### `aws ec2 describe-instances`
 
-This command retrieves information about EC2 instances. The filters select the running instance with the `datacenter-ec2` name tag, and the JMESPath queries extract the instance ID, VPC ID, and security group ID needed by later commands.
+This command retrieves details about EC2 instances in your AWS account.
 
-### `aws ec2 describe-subnets`
+- `aws`: starts the AWS CLI.
+- `ec2`: indicates that the command is for Amazon EC2.
+- `describe-instances`: fetches instance metadata such as instance IDs, VPC IDs, security groups, and state.
+- `--filters`: narrows the search to the instance named `datacenter-ec2` and only includes running instances.
+- `--query`: extracts just the instance ID from the response.
+- `--output text`: provides the output in a clean text format for shell scripts.
 
-This command lists available subnets in the selected VPC. Sorting by Availability Zone makes the selection predictable, while choosing two entries allows the ALB to operate across two Availability Zones.
+This step is important because the load balancer must know which EC2 instance to target and which VPC it belongs to.
+
+### `aws ec2 create-security-group`
+
+This command creates a new security group for the ALB.
+
+- `create-security-group`: creates a new security group in the specified VPC.
+- `--group-name datacenter-sg`: sets the security group name.
+- `--description`: adds a human-readable description of the group.
+- `--vpc-id $VPC_ID`: associates the security group with the same VPC as the EC2 instance.
+- `--query "GroupId" --output text`: returns only the group ID so it can be reused in later commands.
+
+This step ensures the ALB can accept incoming HTTP traffic from the internet.
 
 ### `aws ec2 authorize-security-group-ingress`
 
-This command adds an inbound rule to a security group. HTTP traffic must be allowed for the load balancer to reach the application. The rule should be narrowed to trusted sources in a production environment.
+This command adds an inbound rule to a security group.
+
+- `authorize-security-group-ingress`: opens a port on the selected security group.
+- `--group-id`: identifies which security group to update.
+- `--protocol tcp`: uses the TCP protocol.
+- `--port 80`: allows HTTP traffic.
+- `--cidr 0.0.0.0/0`: permits access from any IPv4 address.
+- `--source-group $ALB_SG_ID`: allows traffic from the ALB security group itself.
+
+This is required to allow the public ALB to receive requests and to allow ALB-to-instance communication.
 
 ### `aws elbv2 create-target-group`
 
-This command creates the backend target group. It defines the protocol, destination port, VPC, and health-check behavior used to determine whether registered targets can receive traffic.
+This command creates the target group used by the ALB.
+
+- `elbv2`: indicates Elastic Load Balancing v2 commands.
+- `create-target-group`: creates a new target group.
+- `--name datacenter-targets`: names the target group.
+- `--protocol HTTP`: uses HTTP for health checks and traffic forwarding.
+- `--port 80`: sends requests to port `80` on the instance.
+- `--vpc-id $VPC_ID`: places the target group in the same VPC as the EC2 instance.
+- `--target-type instance`: registers EC2 instances as targets.
+
+This target group is the backend destination for the ALB.
 
 ### `aws elbv2 register-targets`
 
-This command registers the EC2 instance with the target group. Registration is required before the load balancer can forward requests to that instance.
+This command registers the EC2 instance with the target group.
+
+- `register-targets`: adds a backend target to the target group.
+- `--target-group-arn $TG_ARN`: selects the target group.
+- `--targets Id=$INSTANCE_ID,Port=80`: registers the instance and tells the load balancer to send traffic to port `80` on it.
+
+Without this step, the ALB has no backend to forward traffic to.
 
 ### `aws elbv2 create-load-balancer`
 
-This command creates the Application Load Balancer. `--scheme internet-facing` makes it reachable through a public DNS name, `--type application` selects ALB behavior, and `--subnets` places it in the required Availability Zones.
+This command creates the Application Load Balancer itself.
+
+- `create-load-balancer`: provisions the load balancer resource.
+- `--name datacenter-alb`: assigns the ALB a name.
+- `--subnets $SUBNET_IDS`: places the ALB in public subnets.
+- `--security-groups $ALB_SG_ID`: binds the ALB to the security group that allows HTTP.
+- `--scheme internet-facing`: makes the ALB publicly reachable.
+- `--type application`: creates an ALB instead of a Network Load Balancer.
+
+This is the main infrastructure resource that receives external traffic and forwards it to the instance.
 
 ### `aws elbv2 create-listener`
 
-This command creates the ALB listener. A listener receives connections on a configured protocol and port and applies its default action. Here, HTTP requests on port `80` are forwarded to the target group.
+This command creates an ALB listener that receives incoming HTTP traffic.
+
+- `create-listener`: defines how the ALB should handle requests on a port.
+- `--load-balancer-arn $ALB_ARN`: selects the ALB created earlier.
+- `--protocol HTTP`: listens for HTTP requests.
+- `--port 80`: accepts traffic on port `80`.
+- `--default-actions Type=forward,TargetGroupArn=$TG_ARN`: forwards all requests to the target group.
+
+This completes the routing path from a public URL to the EC2 instance.
 
 ### `aws elbv2 describe-target-health`
 
-This command reports the health state of each registered target. It is the key verification step because a target can be registered but still unable to serve traffic.
+This command checks whether the EC2 instance is healthy and ready to receive traffic.
+
+- `describe-target-health`: shows the health status of all targets in a target group.
+- `--target-group-arn $TG_ARN`: specifies the target group to inspect.
+
+The target should show an `initial` or `healthy` state before you rely on the ALB in production or for testing.
+
+### `curl`
+
+This command is used to test the final endpoint.
+
+```bash
+curl http://$(aws elbv2 describe-load-balancers \
+  --names datacenter-alb \
+  --query "LoadBalancers[0].DNSName" \
+  --output text)
+```
+
+- `curl`: sends an HTTP request.
+- `http://...`: connects to the ALB's DNS name.
+- `$(...)`: resolves the ALB DNS name dynamically from AWS.
+
+If the ALB is working correctly, this command returns the instance's web content, which confirms the HTTP route is functioning.
 
 ## Final Note
 
-The workflow follows a reliable ALB setup pattern:
+The workflow follows a secure and reliable pattern:
 
-1. Find the EC2 instance, VPC, security group, and subnets.
-2. Define and echo every value used by the AWS CLI commands.
-3. Allow the required HTTP traffic.
-4. Create and configure the target group.
-5. Register the EC2 instance as a target.
-6. Create the internet-facing Application Load Balancer and listener.
-7. Verify the listener, target health, and public DNS endpoint.
+1. Find the EC2 instance and its VPC.
+2. Create a dedicated security group for the ALB.
+3. Allow traffic from the ALB to the EC2 instance over port `80`.
+4. Create a target group and register the instance.
+5. Create the ALB and attach the listener.
+6. Verify target health and test the endpoint with the ALB DNS name.
 
-When the target reports `healthy` and `curl` returns the application response, the EC2 instance is successfully available through the Application Load Balancer.
+This ensures the instance is reachable through a public ALB while still keeping the backend service in a controlled, health-checked setup.
